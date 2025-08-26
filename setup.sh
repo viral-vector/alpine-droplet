@@ -188,12 +188,12 @@ chmod +x /usr/local/bin/install-do-console-agent.sh
 
 # --- Hook both helpers to late boot (runs every boot, but each is idempotent/flagged) ---
 mkdir -p /etc/local.d
-cat > /etc/local.d/userdata.start <<'SH'
+cat > /etc/local.d/90-userdata.start <<'SH'
 #!/bin/sh
 /usr/local/bin/do-userdata-compat.sh || true
 /usr/local/bin/install-do-console-agent.sh || true
 SH
-chmod +x /etc/local.d/userdata.start
+chmod +x /etc/local.d/90-userdata.start
 rc-update add local default
 
 # --- Show DigitalOcean Droplet Console agent instructions at login (MOTD) ---
