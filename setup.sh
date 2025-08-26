@@ -33,7 +33,11 @@ grep -q '^PubkeyAuthentication' /etc/ssh/sshd_config || echo 'PubkeyAuthenticati
 
 # --- Tiny Cloud: install early+default OpenRC services (cloud-init style bootstrap) ---
 # This handles DO metadata (hostname, authorized_keys) + user-data + disk grow.
-tiny-cloud --setup
+# --- Tiny Cloud: enable OpenRC services (early + main) ---
+rc-update add tiny-cloud-early sysinit || true
+rc-update add tiny-cloud default || true
+# (Optional) record bootstrap state; not required
+# tiny-cloud --bootstrap complete || true
 
 # --- Serial console on DO/virt (lets you use the web console comfortably) ---
 grep -q 'ttyS0' /etc/inittab || echo 'ttyS0::respawn:/sbin/getty -L 115200 ttyS0 vt100' >> /etc/inittab
