@@ -16,10 +16,13 @@ This will produce `alpine-virt-image-{timestamp}.qcow2.bz2` which can then be up
 
 In this commit, the script will produce alpine `version 3.15` image. If you wanna build latest version, you can pull latest [alpine-make-vm-image repo](https://github.com/alpinelinux/alpine-make-vm-image): `git submodule foreach git pull origin master`
 
-### Installing
+### Building
+#### From Builder
 1. sudo apt update && sudo apt install -y qemu-utils bzip2 e2fsprogs git
 2. git clone https://github.com/viral-vector/alpine-droplet.git
 3. cd alpine-droplet
 4. git submodule update --init --recursive
 5. git submodule foreach git pull origin master
 6. sudo ./build-image.sh
+#### Fetch from Builder
+7. scp root@<builder-ip>:/root/alpine-droplet/alpine-virt-image-*.qcow2.bz2 .
