@@ -31,14 +31,25 @@ ssh-keygen -A
 sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config || true
 grep -q '^PubkeyAuthentication' /etc/ssh/sshd_config || echo 'PubkeyAuthentication yes' >> /etc/ssh/sshd_config
 
-# --- Tiny Cloud: install early+default OpenRC services (cloud-init style bootstrap) ---
-# This handles DO metadata (hostname, authorized_keys) + user-data + disk grow.
-# --- Tiny Cloud: enable OpenRC services (early + main) ---
+# --- Tiny Cloud: enable bootstrap (early via OpenRC; rest via local.d if no service) ---
 rc-update add tiny-cloud-early sysinit || true
-rc-update add tiny-cloud default || true
-# (Optional) record bootstrap state; not required
-# tiny-cloud --bootstrap complete || true
 
+# If an OpenRC 'tiny-cloud' service exists in this version, enable it; otherwise use local.d runner.
+if rc-service -l 2>/dev/null | grep -qx tiny-cloud; then
+  rc-update add tiny-cloud default || true
+else
+  # Run remaining stages at late boot (before our user-data helper)
+  cat > /etc/local.d/05-tiny-cloud.start <<'SH'
+#!/bin/sh
+# Run Tiny Cloud stages if available; ignore failures so boot continues
+if command -v tiny-cloud >/dev/null 2>&1; then
+  tiny-cloud boot   || true
+  tiny-cloud main   || true
+  tiny-cloud final  || true
+fi
+SH
+  chmod +x /etc/local.d/05-tiny-cloud.start
+fi
 # --- Serial console on DO/virt (lets you use the web console comfortably) ---
 grep -q 'ttyS0' /etc/inittab || echo 'ttyS0::respawn:/sbin/getty -L 115200 ttyS0 vt100' >> /etc/inittab
 
