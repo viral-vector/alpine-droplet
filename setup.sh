@@ -186,6 +186,30 @@ fi
 EOS
 chmod +x /usr/local/bin/install-do-console-agent.sh
 
+# --- DO metadata SSH key fetcher (idempotent) ---
+cat > /usr/local/bin/do-fetch-keys.sh <<'EOS'
+#!/bin/sh
+set -eu
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+# Only populate if missing/empty, so Tiny Cloud or manual keys are not overwritten
+if [ ! -s /root/.ssh/authorized_keys ]; then
+  wget -qO- http://169.254.169.254/metadata/v1/public-keys > /root/.ssh/authorized_keys || true
+  chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
+fi
+EOS
+chmod +x /usr/local/bin/do-fetch-keys.sh
+
+# --- Hook helpers to late boot in order: 05-tiny-cloud -> 10-sshkeys -> 90-userdata ---
+mkdir -p /etc/local.d
+cat > /etc/local.d/10-sshkeys.start <<'SH'
+#!/bin/sh
+/usr/local/bin/do-fetch-keys.sh || true
+# ensure sshd is up after keys present
+rc-service sshd restart || rc-service sshd start
+SH
+chmod +x /etc/local.d/10-sshkeys.start
+
 # --- Hook both helpers to late boot (runs every boot, but each is idempotent/flagged) ---
 mkdir -p /etc/local.d
 cat > /etc/local.d/90-userdata.start <<'SH'
