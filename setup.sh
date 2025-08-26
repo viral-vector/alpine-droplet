@@ -38,24 +38,102 @@ tiny-cloud --setup
 # --- Serial console on DO/virt (lets you use the web console comfortably) ---
 grep -q 'ttyS0' /etc/inittab || echo 'ttyS0::respawn:/sbin/getty -L 115200 ttyS0 vt100' >> /etc/inittab
 
-# --- User-data compatibility helper (runs once, late in boot; harmless if nothing to do) ---
+# --- User-data compatibility helper (adds write_files {literal,b64,gz+b64} then runs runcmd) ---
 install -m0755 -d /usr/local/bin
 cat > /usr/local/bin/do-userdata-compat.sh <<'EOS'
 #!/bin/sh
+# Minimal cloud-config handler for Alpine + Tiny Cloud
+# Supports:
+#   write_files:
+#     - path: /path/file
+#       content: |    (literal)   OR content: <base64>
+#       encoding: b64 | base64 | gz+b64 | gzip+b64   (optional)
+#   runcmd:
 set -eu
-UD="http://169.254.169.254/metadata/v1/user-data"
-TMP="/run/user-data"
-if wget -qO "$TMP" "$UD"; then
-  first="$(head -n1 "$TMP" || true)"
-  case "$first" in
-    \#\!*) sh "$TMP" ;;
-    \#cloud-config*)
-      # very small parser for a basic runcmd list
-      awk '/^runcmd:/,/^[^ ]/{print}' "$TMP" | sed '1d' | sed -E 's/^- (.+)$/\1/' | sh || true
-      ;;
-    *) : ;;
+
+UD_URL="http://169.254.169.254/metadata/v1/user-data"
+UD="/run/user-data"
+
+fetch_ud() { wget -qO "$UD" "$UD_URL" || return 1; [ -s "$UD" ] || return 1; }
+
+apply_write_files() {
+  awk '
+    BEGIN{ inwf=0; initem=0; incontent=0; }
+    /^write_files:/ { inwf=1; next }
+    {
+      if (inwf==1) {
+        if ($0 ~ /^[^ ]/ && $0 !~ /^write_files:/) { if (initem==1) print "__WF_FLUSH__"; exit }
+        if ($0 ~ /^ *- +path:[ ]*/) {
+          if (initem==1) print "__WF_FLUSH__"
+          initem=1; incontent=0
+          path=$0; sub(/^ *- +path:[ ]*/,"",path); gsub(/^[ \t]+|[ \t]+$/,"",path)
+          print "__WF_PATH__ " path; next
+        }
+        if ($0 ~ /^[ \t]*encoding:[ ]*/) {
+          enc=$0; sub(/^[ \t]*encoding:[ ]*/,"",enc); gsub(/^[ \t]+|[ \t]+$/,"",enc)
+          print "__WF_ENC__ " enc; next
+        }
+        if ($0 ~ /^[ \t]*content:[ ]*\|[ \t]*$/) { incontent=1; next }
+        if ($0 ~ /^[ \t]*content:[ ]*[^|].*$/) {
+          c=$0; sub(/^[ \t]*content:[ ]*/,"",c); gsub(/^[ \t]+|[ \t]+$/,"",c)
+          print "__WF_B64__ " c; next
+        }
+        if (initem==1 && incontent==1) {
+          if ($0 ~ /^[ \t]*[A-Za-z0-9_-]+:/ || $0 ~ /^ *- +path:/) { incontent=0; next }
+          line=$0; sub(/^[ \t]+/,"",line); print "__WF_LINE__ " line; next
+        }
+      }
+    }
+    END { if (inwf==1 && initem==1) print "__WF_FLUSH__" }
+  ' "$UD" | (
+    P="" ; ENC="" ; BODY="/run/_wf_body"; : > "$BODY"
+    while IFS= read -r L; do
+      case "$L" in
+        __WF_PATH__\ *) P="${L#__WF_PATH__ }"; : > "$BODY" ; ENC=""; rm -f "$BODY.b64" 2>/dev/null || true ;;
+        __WF_ENC__\ *)  ENC="${L#__WF_ENC__ }" ;;
+        __WF_LINE__\ *) printf "%s\n" "${L#__WF_LINE__ }" >> "$BODY" ;;
+        __WF_B64__\ *)  printf "%s\n" "${L#__WF_B64__ }" > "$BODY.b64" ;;
+        __WF_FLUSH__ )
+          [ -n "$P" ] || { : > "$BODY"; rm -f "$BODY.b64" 2>/dev/null || true; continue; }
+          mkdir -p "$(dirname "$P")"
+          TMP="$P.tmp.$$"; ENC_N="$(printf '%s' "$ENC" | tr '[:upper:]' '[:lower:]')"
+          if [ -f "$BODY.b64" ] && [ -s "$BODY.b64" ]; then
+            if [ "$ENC_N" = "gz+b64" ] || [ "$ENC_N" = "gzip+b64" ]; then
+              base64 -d "$BODY.b64" | gzip -d > "$TMP"
+            else
+              base64 -d "$BODY.b64" > "$TMP"
+            fi
+          else
+            cp "$BODY" "$TMP"
+          fi
+          chmod 0644 "$TMP"; mv "$TMP" "$P"
+          P=""; ENC=""; : > "$BODY"; rm -f "$BODY.b64" 2>/dev/null || true
+          ;;
+      esac
+    done
+    rm -f "$BODY" "$BODY.b64" 2>/dev/null || true
+  )
+}
+
+run_runcmd() {
+  awk '
+    /^runcmd:/ { inrc=1; next }
+    inrc==1 {
+      if ($0 ~ /^[^ ]/ && $0 !~ /^ /) { exit }
+      if ($0 ~ /^ *- /) { sub(/^ *- /,""); print }
+    }
+  ' "$UD" | sh || true
+}
+
+main() {
+  fetch_ud || exit 0
+  case "$(head -n1 "$UD" || true)" in
+    \#cloud-config*) apply_write_files; run_runcmd ;;
+    \#\!*)           sh "$UD" || true ;;
+    *)               : ;;
   esac
-fi
+}
+main
 EOS
 chmod +x /usr/local/bin/do-userdata-compat.sh
 
@@ -67,19 +145,14 @@ LOG="/var/log/do-console-agent-install.log"
 FLAG="/var/lib/do-console-agent.installed"
 mkdir -p "$(dirname "$LOG")" "$(dirname "$FLAG")"
 
-# Skip if already marked installed
-if [ -f "$FLAG" ]; then
-  exit 0
-fi
+[ -f "$FLAG" ] && exit 0
 
-# If binary already present, mark success
-if command -v droplet-agent >/dev/null 2>&1 || [ -d /opt/droplet-agent ] || [ -f /etc/systemd/system/droplet-agent.service ] || [ -f /etc/init.d/droplet-agent ]; then
+if command -v droplet-agent >/dev/null 2>&1 || [ -d /opt/droplet-agent ] || \
+   [ -f /etc/systemd/system/droplet-agent.service ] || [ -f /etc/init.d/droplet-agent ]; then
   echo "$(date -Is) droplet-agent appears present; marking installed." >> "$LOG"
-  : > "$FLAG"
-  exit 0
+  : > "$FLAG"; exit 0
 fi
 
-# Try official installer (requires bash). Do not fail boot if it rejects Alpine.
 {
   echo "=== $(date -Is) Starting DO console agent install ==="
   if command -v curl >/dev/null 2>&1; then
@@ -90,15 +163,11 @@ fi
   echo "=== $(date -Is) Installer finished (exit=$?) ==="
 } >> "$LOG" 2>&1 || true
 
-# Mark as installed only if agent now exists
 if command -v droplet-agent >/dev/null 2>&1 || [ -d /opt/droplet-agent ]; then
-  : > "$FLAG"
-  echo "$(date -Is) droplet-agent detected after install; success." >> "$LOG"
+  : > "$FLAG"; echo "$(date -Is) droplet-agent detected after install; success." >> "$LOG"
 else
-  echo "$(date -Is) droplet-agent not detected; likely unsupported on Alpine. See $LOG. Leaving MOTD hint." >> "$LOG"
+  echo "$(date -Is) droplet-agent not detected; likely unsupported on Alpine. See $LOG." >> "$LOG"
 fi
-
-exit 0
 EOS
 chmod +x /usr/local/bin/install-do-console-agent.sh
 
@@ -117,13 +186,6 @@ cat > /etc/motd <<'MOTD'
 DigitalOcean Droplet Console
 Use the Droplet Console for native-like browser access to your Droplet.
 This image auto-attempts to install the agent on first boot (see: /var/log/do-console-agent-install.log).
-
-If needed, you can try manually:
-  curl -sSL https://repos-droplet.digitalocean.com/install.sh | sudo bash
-  # or
-  wget -qO- https://repos-droplet.digitalocean.com/install.sh | sudo bash
-
-Note: The script may refuse on unsupported distros; Alpine might require manual steps.
 MOTD
 
 # --- Cleanup apk cache to keep image tiny ---

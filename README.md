@@ -20,7 +20,7 @@ In this commit, the script will produce alpine `version 3.15` image. If you wann
 #### From Builder
 1. sudo apt update && sudo apt install -y qemu-utils bzip2 e2fsprogs git
 2. git clone https://github.com/viral-vector/alpine-droplet.git
-3. cd alpine-droplet
+3. cd alpine-droplet && git branch <vgn>
 4. git submodule update --init --recursive
 5. git submodule foreach git pull origin master
 6. sudo ./build-image.sh
