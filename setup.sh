@@ -2,12 +2,12 @@
 # setup.sh - runs INSIDE the Alpine chroot during image build
 set -eux
 
-# --- Repos: pin stable + community (required for tiny-cloud and utilities) ---
+# Repos (stable + community)
 echo "https://dl-cdn.alpinelinux.org/alpine/latest-stable/main" > /etc/apk/repositories
 echo "https://dl-cdn.alpinelinux.org/alpine/latest-stable/community" >> /etc/apk/repositories
 apk update
 
-# --- Base packages for cloud usage on DO (keep minimal) ---
+# Base packages
 apk add --no-cache \
   linux-virt \
   openssh \
@@ -15,7 +15,7 @@ apk add --no-cache \
   tiny-cloud tiny-cloud-openrc tiny-cloud-digitalocean tiny-cloud-nocloud \
   wget curl ca-certificates bash
 
-# --- Networking: bring up eth0 via DHCP using ifupdown-ng (OpenRC's networking) ---
+# Networking: DHCP on eth0
 cat > /etc/network/interfaces <<'EOF'
 auto lo
 iface lo inet loopback
@@ -25,23 +25,21 @@ iface eth0 inet dhcp
 EOF
 rc-update add networking default
 
-# --- SSH: enable on boot; generate host keys; key-only auth (DO injects keys) ---
+# SSH: enable, host keys, key-only auth
 rc-update add sshd default || true
 ssh-keygen -A
 sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config || true
 grep -q '^PubkeyAuthentication' /etc/ssh/sshd_config || echo 'PubkeyAuthentication yes' >> /etc/ssh/sshd_config
+grep -q '^PermitRootLogin' /etc/ssh/sshd_config || echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
+grep -q '^AuthorizedKeysFile' /etc/ssh/sshd_config || echo 'AuthorizedKeysFile .ssh/authorized_keys' >> /etc/ssh/sshd_config
 
-# --- Tiny Cloud: enable bootstrap (early via OpenRC; rest via local.d if no service) ---
+# Tiny Cloud bootstrap: early via OpenRC; rest via local.d if no service
 rc-update add tiny-cloud-early sysinit || true
-
-# If an OpenRC 'tiny-cloud' service exists in this version, enable it; otherwise use local.d runner.
 if rc-service -l 2>/dev/null | grep -qx tiny-cloud; then
   rc-update add tiny-cloud default || true
 else
-  # Run remaining stages at late boot (before our user-data helper)
   cat > /etc/local.d/05-tiny-cloud.start <<'SH'
 #!/bin/sh
-# Run Tiny Cloud stages if available; ignore failures so boot continues
 if command -v tiny-cloud >/dev/null 2>&1; then
   tiny-cloud boot   || true
   tiny-cloud main   || true
@@ -50,22 +48,15 @@ fi
 SH
   chmod +x /etc/local.d/05-tiny-cloud.start
 fi
-# --- Serial console on DO/virt (lets you use the web console comfortably) ---
+
+# Serial console for DO console
 grep -q 'ttyS0' /etc/inittab || echo 'ttyS0::respawn:/sbin/getty -L 115200 ttyS0 vt100' >> /etc/inittab
 
-# --- User-data compatibility helper (adds write_files {literal,b64,gz+b64} then runs runcmd) ---
+# User-data handler: supports write_files (literal/b64/gz+b64) + runcmd
 install -m0755 -d /usr/local/bin
 cat > /usr/local/bin/do-userdata-compat.sh <<'EOS'
 #!/bin/sh
-# Minimal cloud-config handler for Alpine + Tiny Cloud
-# Supports:
-#   write_files:
-#     - path: /path/file
-#       content: |    (literal)   OR content: <base64>
-#       encoding: b64 | base64 | gz+b64 | gzip+b64   (optional)
-#   runcmd:
 set -eu
-
 UD_URL="http://169.254.169.254/metadata/v1/user-data"
 UD="/run/user-data"
 
@@ -104,7 +95,7 @@ apply_write_files() {
     P="" ; ENC="" ; BODY="/run/_wf_body"; : > "$BODY"
     while IFS= read -r L; do
       case "$L" in
-        __WF_PATH__\ *) P="${L#__WF_PATH__ }"; : > "$BODY" ; ENC=""; rm -f "$BODY.b64" 2>/dev/null || true ;;
+        __WF_PATH__\ *) P="${L#__WF_PATH__ }"; : > "$BODY"; ENC=""; rm -f "$BODY.b64" 2>/dev/null || true ;;
         __WF_ENC__\ *)  ENC="${L#__WF_ENC__ }" ;;
         __WF_LINE__\ *) printf "%s\n" "${L#__WF_LINE__ }" >> "$BODY" ;;
         __WF_B64__\ *)  printf "%s\n" "${L#__WF_B64__ }" > "$BODY.b64" ;;
@@ -152,47 +143,12 @@ main
 EOS
 chmod +x /usr/local/bin/do-userdata-compat.sh
 
-# --- DigitalOcean Droplet Console agent: best-effort auto-install on first boot ---
-cat > /usr/local/bin/install-do-console-agent.sh <<'EOS'
-#!/bin/sh
-set -eu
-LOG="/var/log/do-console-agent-install.log"
-FLAG="/var/lib/do-console-agent.installed"
-mkdir -p "$(dirname "$LOG")" "$(dirname "$FLAG")"
-
-[ -f "$FLAG" ] && exit 0
-
-if command -v droplet-agent >/dev/null 2>&1 || [ -d /opt/droplet-agent ] || \
-   [ -f /etc/systemd/system/droplet-agent.service ] || [ -f /etc/init.d/droplet-agent ]; then
-  echo "$(date -Is) droplet-agent appears present; marking installed." >> "$LOG"
-  : > "$FLAG"; exit 0
-fi
-
-{
-  echo "=== $(date -Is) Starting DO console agent install ==="
-  if command -v curl >/dev/null 2>&1; then
-    (curl -sSL https://repos-droplet.digitalocean.com/install.sh | bash) 2>&1
-  else
-    (wget -qO- https://repos-droplet.digitalocean.com/install.sh | bash) 2>&1
-  fi
-  echo "=== $(date -Is) Installer finished (exit=$?) ==="
-} >> "$LOG" 2>&1 || true
-
-if command -v droplet-agent >/dev/null 2>&1 || [ -d /opt/droplet-agent ]; then
-  : > "$FLAG"; echo "$(date -Is) droplet-agent detected after install; success." >> "$LOG"
-else
-  echo "$(date -Is) droplet-agent not detected; likely unsupported on Alpine. See $LOG." >> "$LOG"
-fi
-EOS
-chmod +x /usr/local/bin/install-do-console-agent.sh
-
-# --- DO metadata SSH key fetcher (idempotent) ---
+# DO metadata SSH key fetcher
 cat > /usr/local/bin/do-fetch-keys.sh <<'EOS'
 #!/bin/sh
 set -eu
 mkdir -p /root/.ssh
 chmod 700 /root/.ssh
-# Only populate if missing/empty, so Tiny Cloud or manual keys are not overwritten
 if [ ! -s /root/.ssh/authorized_keys ]; then
   wget -qO- http://169.254.169.254/metadata/v1/public-keys > /root/.ssh/authorized_keys || true
   chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
@@ -200,32 +156,25 @@ fi
 EOS
 chmod +x /usr/local/bin/do-fetch-keys.sh
 
-# --- Hook helpers to late boot in order: 05-tiny-cloud -> 10-sshkeys -> 90-userdata ---
+# Local hooks: 05-tiny-cloud (above), 10-sshkeys, 90-userdata
 mkdir -p /etc/local.d
 cat > /etc/local.d/10-sshkeys.start <<'SH'
 #!/bin/sh
 /usr/local/bin/do-fetch-keys.sh || true
-# ensure sshd is up after keys present
 rc-service sshd restart || rc-service sshd start
 SH
 chmod +x /etc/local.d/10-sshkeys.start
 
-# --- Hook both helpers to late boot (runs every boot, but each is idempotent/flagged) ---
-mkdir -p /etc/local.d
 cat > /etc/local.d/90-userdata.start <<'SH'
 #!/bin/sh
 /usr/local/bin/do-userdata-compat.sh || true
-/usr/local/bin/install-do-console-agent.sh || true
 SH
 chmod +x /etc/local.d/90-userdata.start
+
 rc-update add local default
 
-# --- Show DigitalOcean Droplet Console agent instructions at login (MOTD) ---
-cat > /etc/motd <<'MOTD'
-DigitalOcean Droplet Console
-Use the Droplet Console for native-like browser access to your Droplet.
-This image auto-attempts to install the agent on first boot (see: /var/log/do-console-agent-install.log).
-MOTD
+# MOTD
+echo 'Alpine Linux on DigitalOcean' > /etc/motd
 
-# --- Cleanup apk cache to keep image tiny ---
+# Cleanup
 rm -rf /var/cache/apk/*
