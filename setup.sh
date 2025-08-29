@@ -56,37 +56,64 @@ grep -q 'ttyS0' /etc/inittab || echo 'ttyS0::respawn:/sbin/getty -L 115200 ttyS0
 install -m0755 -d /usr/local/bin
 cat > /usr/local/bin/do-userdata-compat.sh <<'EOS'
 #!/bin/sh
+# Minimal cloud-config handler for Alpine + Tiny Cloud
+# Supports write_files (literal, b64, gz+b64) and runcmd.
+# Logs to /var/log/userdata-compat.log for troubleshooting.
 set -eu
+
+LOG="/var/log/userdata-compat.log"
 UD_URL="http://169.254.169.254/metadata/v1/user-data"
 UD="/run/user-data"
 
-fetch_ud() { wget -qO "$UD" "$UD_URL" || return 1; [ -s "$UD" ] || return 1; }
+log() { printf '%s %s\n' "$(date -Is)" "$*" >> "$LOG"; }
+
+fetch_ud() {
+  mkdir -p /run
+  if ! wget -qO "$UD" "$UD_URL"; then
+    log "fetch: no user-data from metadata"
+    return 1
+  fi
+  if [ ! -s "$UD" ]; then
+    log "fetch: user-data empty"
+    return 1
+  fi
+  # Keep a copy for inspection
+  cp "$UD" /var/log/user-data.raw 2>/dev/null || true
+  log "fetch: user-data saved to /var/log/user-data.raw"
+}
 
 apply_write_files() {
+  log "write_files: start"
   awk '
     BEGIN{ inwf=0; initem=0; incontent=0; }
-    /^write_files:/ { inwf=1; next }
+    /^[[:space:]]*write_files:[[:space:]]*$/ { inwf=1; next }
     {
       if (inwf==1) {
-        if ($0 ~ /^[^ ]/ && $0 !~ /^write_files:/) { if (initem==1) print "__WF_FLUSH__"; exit }
-        if ($0 ~ /^ *- +path:[ ]*/) {
+        # end of block: next top-level key (no leading space)
+        if ($0 ~ /^[^[:space:]]/ && $0 !~ /^write_files:/) { if (initem==1) print "__WF_FLUSH__"; exit }
+        # new item with path:
+        if ($0 ~ /^[[:space:]]*-[[:space:]]+path:[[:space:]]*/) {
           if (initem==1) print "__WF_FLUSH__"
           initem=1; incontent=0
-          path=$0; sub(/^ *- +path:[ ]*/,"",path); gsub(/^[ \t]+|[ \t]+$/,"",path)
+          path=$0; sub(/^[[:space:]]*-[[:space:]]+path:[[:space:]]*/,"",path); gsub(/^[[:space:]]+|[[:space:]]+$/,"",path)
           print "__WF_PATH__ " path; next
         }
-        if ($0 ~ /^[ \t]*encoding:[ ]*/) {
-          enc=$0; sub(/^[ \t]*encoding:[ ]*/,"",enc); gsub(/^[ \t]+|[ \t]+$/,"",enc)
+        # encoding:
+        if ($0 ~ /^[[:space:]]*encoding:[[:space:]]*/) {
+          enc=$0; sub(/^[[:space:]]*encoding:[[:space:]]*/,"",enc); gsub(/^[[:space:]]+|[[:space:]]+$/,"",enc)
           print "__WF_ENC__ " enc; next
         }
-        if ($0 ~ /^[ \t]*content:[ ]*\|[ \t]*$/) { incontent=1; next }
-        if ($0 ~ /^[ \t]*content:[ ]*[^|].*$/) {
-          c=$0; sub(/^[ \t]*content:[ ]*/,"",c); gsub(/^[ \t]+|[ \t]+$/,"",c)
+        # content: |
+        if ($0 ~ /^[[:space:]]*content:[[:space:]]*\|[[:space:]]*$/) { incontent=1; next }
+        # content: <inline>
+        if ($0 ~ /^[[:space:]]*content:[[:space:]]*[^|].*$/) {
+          c=$0; sub(/^[[:space:]]*content:[[:space:]]*/,"",c); gsub(/^[[:space:]]+|[[:space:]]+$/,"",c)
           print "__WF_B64__ " c; next
         }
+        # literal lines (stay while indented)
         if (initem==1 && incontent==1) {
-          if ($0 ~ /^[ \t]*[A-Za-z0-9_-]+:/ || $0 ~ /^ *- +path:/) { incontent=0; next }
-          line=$0; sub(/^[ \t]+/,"",line); print "__WF_LINE__ " line; next
+          if ($0 ~ /^[[:space:]]*[A-Za-z0-9_-]+:/ || $0 ~ /^[[:space:]]*-[[:space:]]+path:/) { incontent=0; next }
+          line=$0; sub(/^[[:space:]]+/,"",line); print "__WF_LINE__ " line; next
         }
       }
     }
@@ -113,31 +140,39 @@ apply_write_files() {
             cp "$BODY" "$TMP"
           fi
           chmod 0644 "$TMP"; mv "$TMP" "$P"
+          log "write_files: wrote $P (enc=${ENC_N:-literal})"
           P=""; ENC=""; : > "$BODY"; rm -f "$BODY.b64" 2>/dev/null || true
           ;;
       esac
     done
     rm -f "$BODY" "$BODY.b64" 2>/dev/null || true
   )
+  log "write_files: done"
 }
 
 run_runcmd() {
+  log "runcmd: start"
+  # Execute simple runcmd list of shell lines
   awk '
-    /^runcmd:/ { inrc=1; next }
+    /^[[:space:]]*runcmd:[[:space:]]*$/ { inrc=1; next }
     inrc==1 {
-      if ($0 ~ /^[^ ]/ && $0 !~ /^ /) { exit }
-      if ($0 ~ /^ *- /) { sub(/^ *- /,""); print }
+      if ($0 ~ /^[^[:space:]]/ && $0 !~ /^ /) { exit }
+      if ($0 ~ /^[[:space:]]*-[[:space:]]+/) { sub(/^[[:space:]]*-[[:space:]]+/,""); print }
     }
-  ' "$UD" | sh || true
+  ' "$UD" | sh 2>>"$LOG" || true
+  log "runcmd: done"
 }
 
 main() {
-  fetch_ud || exit 0
+  : > "$LOG"
+  log "start"
+  if ! fetch_ud; then log "no user-data; exit"; exit 0; fi
   case "$(head -n1 "$UD" || true)" in
     \#cloud-config*) apply_write_files; run_runcmd ;;
-    \#\!*)           sh "$UD" || true ;;
-    *)               : ;;
+    \#\!*)           log "shell user-data detected"; sh "$UD" || true ;;
+    *)               log "unknown user-data header; ignore" ;;
   esac
+  log "finish"
 }
 main
 EOS
