@@ -13,7 +13,12 @@ apk add --no-cache \
   openssh \
   e2fsprogs cloud-utils-growpart \
   tiny-cloud tiny-cloud-openrc tiny-cloud-digitalocean tiny-cloud-nocloud \
-  wget curl ca-certificates bash
+  wget curl ca-certificates bash \
+  eudev udev-init-scripts
+
+rc-update add udev sysinit
+rc-update add udev-trigger sysinit
+rc-update add udev-settle sysinit
 
 # Networking: DHCP on eth0
 cat > /etc/network/interfaces <<'EOF'
@@ -79,6 +84,7 @@ fetch_ud() {
   fi
   # Keep a copy for inspection
   cp "$UD" /var/log/user-data.raw 2>/dev/null || true
+  sed -i 's/\r$//' "$UD" || true
   log "fetch: user-data saved to /var/log/user-data.raw"
 }
 
